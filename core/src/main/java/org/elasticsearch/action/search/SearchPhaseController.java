@@ -33,13 +33,12 @@ import org.apache.lucene.search.TopFieldDocs;
 import org.apache.lucene.search.grouping.CollapseTopFieldDocs;
 import org.elasticsearch.common.collect.HppcMaps;
 import org.elasticsearch.common.component.AbstractComponent;
-import org.elasticsearch.common.lucene.Lucene;
 import org.elasticsearch.common.settings.Settings;
 import org.elasticsearch.common.util.BigArrays;
-import org.elasticsearch.common.util.concurrent.AtomicArray;
 import org.elasticsearch.script.ScriptService;
 import org.elasticsearch.search.SearchHit;
 import org.elasticsearch.search.SearchHits;
+import org.elasticsearch.search.SearchPhaseResult;
 import org.elasticsearch.search.aggregations.InternalAggregation;
 import org.elasticsearch.search.aggregations.InternalAggregation.ReduceContext;
 import org.elasticsearch.search.aggregations.InternalAggregations;
@@ -52,7 +51,6 @@ import org.elasticsearch.search.internal.InternalSearchResponse;
 import org.elasticsearch.search.profile.ProfileShardResult;
 import org.elasticsearch.search.profile.SearchProfileShardResults;
 import org.elasticsearch.search.query.QuerySearchResult;
-import org.elasticsearch.search.query.QuerySearchResultProvider;
 import org.elasticsearch.search.suggest.Suggest;
 import org.elasticsearch.search.suggest.Suggest.Suggestion;
 import org.elasticsearch.search.suggest.Suggest.Suggestion.Entry;
@@ -61,14 +59,16 @@ import org.elasticsearch.search.suggest.completion.CompletionSuggestion;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.function.IntFunction;
 import java.util.stream.Collectors;
 import java.util.stream.StreamSupport;
 
-public class SearchPhaseController extends AbstractComponent {
+public final class SearchPhaseController extends AbstractComponent {
 
     private static final ScoreDoc[] EMPTY_DOCS = new ScoreDoc[0];
 
@@ -81,13 +81,13 @@ public class SearchPhaseController extends AbstractComponent {
         this.scriptService = scriptService;
     }
 
-    public AggregatedDfs aggregateDfs(AtomicArray<DfsSearchResult> results) {
+    public AggregatedDfs aggregateDfs(Collection<DfsSearchResult> results) {
         ObjectObjectHashMap<Term, TermStatistics> termStatistics = HppcMaps.newNoNullKeysMap();
         ObjectObjectHashMap<String, CollectionStatistics> fieldStatistics = HppcMaps.newNoNullKeysMap();
         long aggMaxDoc = 0;
-        for (AtomicArray.Entry<DfsSearchResult> lEntry : results.asList()) {
-            final Term[] terms = lEntry.value.terms();
-            final TermStatistics[] stats = lEntry.value.termStatistics();
+        for (DfsSearchResult lEntry : results) {
+            final Term[] terms = lEntry.terms();
+            final TermStatistics[] stats = lEntry.termStatistics();
             assert terms.length == stats.length;
             for (int i = 0; i < terms.length; i++) {
                 assert terms[i] != null;
@@ -105,9 +105,9 @@ public class SearchPhaseController extends AbstractComponent {
 
             }
 
-            assert !lEntry.value.fieldStatistics().containsKey(null);
-            final Object[] keys = lEntry.value.fieldStatistics().keys;
-            final Object[] values = lEntry.value.fieldStatistics().values;
+            assert !lEntry.fieldStatistics().containsKey(null);
+            final Object[] keys = lEntry.fieldStatistics().keys;
+            final Object[] values = lEntry.fieldStatistics().values;
             for (int i = 0; i < keys.length; i++) {
                 if (keys[i] != null) {
                     String key = (String) keys[i];
@@ -127,7 +127,7 @@ public class SearchPhaseController extends AbstractComponent {
                     }
                 }
             }
-            aggMaxDoc += lEntry.value.maxDoc();
+            aggMaxDoc += lEntry.maxDoc();
         }
         return new AggregatedDfs(termStatistics, fieldStatistics, aggMaxDoc);
     }
@@ -146,159 +146,109 @@ public class SearchPhaseController extends AbstractComponent {
      *
      * @param ignoreFrom Whether to ignore the from and sort all hits in each shard result.
      *                   Enabled only for scroll search, because that only retrieves hits of length 'size' in the query phase.
-     * @param resultsArr Shard result holder
+     * @param results the search phase results to obtain the sort docs from
      */
-    public ScoreDoc[] sortDocs(boolean ignoreFrom, AtomicArray<? extends QuerySearchResultProvider> resultsArr) throws IOException {
-        List<? extends AtomicArray.Entry<? extends QuerySearchResultProvider>> results = resultsArr.asList();
+    public ScoreDoc[] sortDocs(boolean ignoreFrom, Collection<? extends SearchPhaseResult> results) throws IOException {
         if (results.isEmpty()) {
             return EMPTY_DOCS;
         }
-
-        final QuerySearchResult result;
-        boolean canOptimize = false;
-        int shardIndex = -1;
-        if (results.size() == 1) {
-            canOptimize = true;
-            result = results.get(0).value.queryResult();
-            shardIndex = results.get(0).index;
-        } else {
-            boolean hasResult = false;
-            QuerySearchResult resultToOptimize = null;
-            // lets see if we only got hits from a single shard, if so, we can optimize...
-            for (AtomicArray.Entry<? extends QuerySearchResultProvider> entry : results) {
-                if (entry.value.queryResult().hasHits()) {
-                    if (hasResult) { // we already have one, can't really optimize
-                        canOptimize = false;
-                        break;
-                    }
-                    canOptimize = true;
-                    hasResult = true;
-                    resultToOptimize = entry.value.queryResult();
-                    shardIndex = entry.index;
-                }
-            }
-            result = canOptimize ? resultToOptimize : results.get(0).value.queryResult();
-            assert result != null;
-        }
-        if (canOptimize) {
-            int offset = result.from();
-            if (ignoreFrom) {
-                offset = 0;
-            }
-            ScoreDoc[] scoreDocs = result.topDocs().scoreDocs;
-            ScoreDoc[] docs;
-            int numSuggestDocs = 0;
-            final Suggest suggest = result.queryResult().suggest();
-            final List<CompletionSuggestion> completionSuggestions;
-            if (suggest != null) {
-                completionSuggestions = suggest.filter(CompletionSuggestion.class);
-                for (CompletionSuggestion suggestion : completionSuggestions) {
-                    numSuggestDocs += suggestion.getOptions().size();
-                }
-            } else {
-                completionSuggestions = Collections.emptyList();
-            }
-            int docsOffset = 0;
-            if (scoreDocs.length == 0 || scoreDocs.length < offset) {
-                docs = new ScoreDoc[numSuggestDocs];
-            } else {
-                int resultDocsSize = result.size();
-                if ((scoreDocs.length - offset) < resultDocsSize) {
-                    resultDocsSize = scoreDocs.length - offset;
-                }
-                docs = new ScoreDoc[resultDocsSize + numSuggestDocs];
-                for (int i = 0; i < resultDocsSize; i++) {
-                    ScoreDoc scoreDoc = scoreDocs[offset + i];
-                    scoreDoc.shardIndex = shardIndex;
-                    docs[i] = scoreDoc;
-                    docsOffset++;
-                }
-            }
-            for (CompletionSuggestion suggestion: completionSuggestions) {
-                for (CompletionSuggestion.Entry.Option option : suggestion.getOptions()) {
-                    ScoreDoc doc = option.getDoc();
-                    doc.shardIndex = shardIndex;
-                    docs[docsOffset++] = doc;
-                }
-            }
-            return docs;
-        }
-
-        final int topN = result.queryResult().size();
-        final int from =  ignoreFrom ? 0 : result.queryResult().from();
-
-        final TopDocs mergedTopDocs;
-        final int numShards = resultsArr.length();
-        if (result.queryResult().topDocs() instanceof CollapseTopFieldDocs) {
-            CollapseTopFieldDocs firstTopDocs = (CollapseTopFieldDocs) result.queryResult().topDocs();
-            final Sort sort = new Sort(firstTopDocs.fields);
-            final CollapseTopFieldDocs[] shardTopDocs = new CollapseTopFieldDocs[numShards];
-            fillTopDocs(shardTopDocs, results, new CollapseTopFieldDocs(firstTopDocs.field, 0, new FieldDoc[0],
-                sort.getSort(), new Object[0], Float.NaN));
-            mergedTopDocs = CollapseTopFieldDocs.merge(sort, from, topN, shardTopDocs);
-        } else if (result.queryResult().topDocs() instanceof TopFieldDocs) {
-            TopFieldDocs firstTopDocs = (TopFieldDocs) result.queryResult().topDocs();
-            final Sort sort = new Sort(firstTopDocs.fields);
-            final TopFieldDocs[] shardTopDocs = new TopFieldDocs[resultsArr.length()];
-            fillTopDocs(shardTopDocs, results, new TopFieldDocs(0, new FieldDoc[0], sort.getSort(), Float.NaN));
-            mergedTopDocs = TopDocs.merge(sort, from, topN, shardTopDocs, true);
-        } else {
-            final TopDocs[] shardTopDocs = new TopDocs[resultsArr.length()];
-            fillTopDocs(shardTopDocs, results, Lucene.EMPTY_TOP_DOCS);
-            mergedTopDocs = TopDocs.merge(from, topN, shardTopDocs, true);
-        }
-
-        ScoreDoc[] scoreDocs = mergedTopDocs.scoreDocs;
+        final Collection<TopDocs> topDocs = new ArrayList<>();
         final Map<String, List<Suggestion<CompletionSuggestion.Entry>>> groupedCompletionSuggestions = new HashMap<>();
-        // group suggestions and assign shard index
-        for (AtomicArray.Entry<? extends QuerySearchResultProvider> sortedResult : results) {
-            Suggest shardSuggest = sortedResult.value.queryResult().suggest();
-            if (shardSuggest != null) {
-                for (CompletionSuggestion suggestion : shardSuggest.filter(CompletionSuggestion.class)) {
-                    suggestion.setShardIndex(sortedResult.index);
-                    List<Suggestion<CompletionSuggestion.Entry>> suggestions =
-                        groupedCompletionSuggestions.computeIfAbsent(suggestion.getName(), s -> new ArrayList<>());
-                    suggestions.add(suggestion);
+        int from = -1;
+        int size = -1;
+        for (SearchPhaseResult sortedResult : results) {
+            /* We loop over all results once, group together the completion suggestions if there are any and collect relevant
+             * top docs results. Each top docs gets it's shard index set on all top docs to simplify top docs merging down the road
+             * this allowed to remove a single shared optimization code here since now we don't materialized a dense array of
+             * top docs anymore but instead only pass relevant results / top docs to the merge method*/
+            QuerySearchResult queryResult = sortedResult.queryResult();
+            if (queryResult.hasHits()) {
+                from = queryResult.from();
+                size = queryResult.size();
+                TopDocs td = queryResult.topDocs();
+                if (td != null && td.scoreDocs.length > 0) {
+                    setShardIndex(td, queryResult.getShardIndex());
+                    topDocs.add(td);
+                }
+                Suggest shardSuggest = queryResult.suggest();
+                if (shardSuggest != null) {
+                    for (CompletionSuggestion suggestion : shardSuggest.filter(CompletionSuggestion.class)) {
+                        suggestion.setShardIndex(sortedResult.getShardIndex());
+                        List<Suggestion<CompletionSuggestion.Entry>> suggestions =
+                            groupedCompletionSuggestions.computeIfAbsent(suggestion.getName(), s -> new ArrayList<>());
+                        suggestions.add(suggestion);
+                    }
                 }
             }
         }
-        if (groupedCompletionSuggestions.isEmpty() == false) {
-            int numSuggestDocs = 0;
-            List<Suggestion<? extends Entry<? extends Entry.Option>>> completionSuggestions =
-                new ArrayList<>(groupedCompletionSuggestions.size());
-            for (List<Suggestion<CompletionSuggestion.Entry>> groupedSuggestions : groupedCompletionSuggestions.values()) {
-                final CompletionSuggestion completionSuggestion = CompletionSuggestion.reduceTo(groupedSuggestions);
-                assert completionSuggestion != null;
-                numSuggestDocs += completionSuggestion.getOptions().size();
-                completionSuggestions.add(completionSuggestion);
-            }
-            scoreDocs = new ScoreDoc[mergedTopDocs.scoreDocs.length + numSuggestDocs];
-            System.arraycopy(mergedTopDocs.scoreDocs, 0, scoreDocs, 0, mergedTopDocs.scoreDocs.length);
-            int offset = mergedTopDocs.scoreDocs.length;
-            Suggest suggestions = new Suggest(completionSuggestions);
-            for (CompletionSuggestion completionSuggestion : suggestions.filter(CompletionSuggestion.class)) {
-                for (CompletionSuggestion.Entry.Option option : completionSuggestion.getOptions()) {
-                    scoreDocs[offset++] = option.getDoc();
+        if (size != -1) {
+            final ScoreDoc[] mergedScoreDocs = mergeTopDocs(topDocs, size, ignoreFrom ? 0 : from);
+            ScoreDoc[] scoreDocs = mergedScoreDocs;
+            if (groupedCompletionSuggestions.isEmpty() == false) {
+                int numSuggestDocs = 0;
+                List<Suggestion<? extends Entry<? extends Entry.Option>>> completionSuggestions =
+                    new ArrayList<>(groupedCompletionSuggestions.size());
+                for (List<Suggestion<CompletionSuggestion.Entry>> groupedSuggestions : groupedCompletionSuggestions.values()) {
+                    final CompletionSuggestion completionSuggestion = CompletionSuggestion.reduceTo(groupedSuggestions);
+                    assert completionSuggestion != null;
+                    numSuggestDocs += completionSuggestion.getOptions().size();
+                    completionSuggestions.add(completionSuggestion);
+                }
+                scoreDocs = new ScoreDoc[mergedScoreDocs.length + numSuggestDocs];
+                System.arraycopy(mergedScoreDocs, 0, scoreDocs, 0, mergedScoreDocs.length);
+                int offset = mergedScoreDocs.length;
+                Suggest suggestions = new Suggest(completionSuggestions);
+                for (CompletionSuggestion completionSuggestion : suggestions.filter(CompletionSuggestion.class)) {
+                    for (CompletionSuggestion.Entry.Option option : completionSuggestion.getOptions()) {
+                        scoreDocs[offset++] = option.getDoc();
+                    }
                 }
             }
+            return scoreDocs;
+        } else {
+            // no relevant docs - just return an empty array
+            return EMPTY_DOCS;
         }
-        return scoreDocs;
     }
 
-    static <T extends TopDocs> void fillTopDocs(T[] shardTopDocs,
-                                                        List<? extends AtomicArray.Entry<? extends QuerySearchResultProvider>> results,
-                                                        T empytTopDocs) {
-        if (results.size() != shardTopDocs.length) {
-            // TopDocs#merge can't deal with null shard TopDocs
-            Arrays.fill(shardTopDocs, empytTopDocs);
+    private ScoreDoc[] mergeTopDocs(Collection<TopDocs> results, int topN, int from) {
+        if (results.isEmpty()) {
+            return EMPTY_DOCS;
         }
-        for (AtomicArray.Entry<? extends QuerySearchResultProvider> resultProvider : results) {
-            final T topDocs = (T) resultProvider.value.queryResult().topDocs();
-            assert topDocs != null : "top docs must not be null in a valid result";
-            // the 'index' field is the position in the resultsArr atomic array
-            shardTopDocs[resultProvider.index] = topDocs;
+        final boolean setShardIndex = false;
+        final TopDocs topDocs = results.stream().findFirst().get();
+        final TopDocs mergedTopDocs;
+        final int numShards = results.size();
+        if (numShards == 1 && from == 0) { // only one shard and no pagination we can just return the topDocs as we got them.
+            return topDocs.scoreDocs;
+        } else if (topDocs instanceof CollapseTopFieldDocs) {
+            CollapseTopFieldDocs firstTopDocs = (CollapseTopFieldDocs) topDocs;
+            final Sort sort = new Sort(firstTopDocs.fields);
+            final CollapseTopFieldDocs[] shardTopDocs = results.toArray(new CollapseTopFieldDocs[numShards]);
+            mergedTopDocs = CollapseTopFieldDocs.merge(sort, from, topN, shardTopDocs, setShardIndex);
+        } else if (topDocs instanceof TopFieldDocs) {
+            TopFieldDocs firstTopDocs = (TopFieldDocs) topDocs;
+            final Sort sort = new Sort(firstTopDocs.fields);
+            final TopFieldDocs[] shardTopDocs = results.toArray(new TopFieldDocs[numShards]);
+            mergedTopDocs = TopDocs.merge(sort, from, topN, shardTopDocs, setShardIndex);
+        } else {
+            final TopDocs[] shardTopDocs = results.toArray(new TopDocs[numShards]);
+            mergedTopDocs = TopDocs.merge(from, topN, shardTopDocs, setShardIndex);
+        }
+        return mergedTopDocs.scoreDocs;
+    }
+
+    private static void setShardIndex(TopDocs topDocs, int shardIndex) {
+        for (ScoreDoc doc : topDocs.scoreDocs) {
+            if (doc.shardIndex != -1) {
+                // once there is a single shard index initialized all others will be initialized too
+                // there are many asserts down in lucene land that this is actually true. we can shortcut it here.
+                return;
+            }
+            doc.shardIndex = shardIndex;
         }
     }
+
     public ScoreDoc[] getLastEmittedDocPerShard(ReducedQueryPhase reducedQueryPhase,
                                                 ScoreDoc[] sortedScoreDocs, int numShards) {
         ScoreDoc[] lastEmittedDocPerShard = new ScoreDoc[numShards];
@@ -340,12 +290,11 @@ public class SearchPhaseController extends AbstractComponent {
      */
     public InternalSearchResponse merge(boolean ignoreFrom, ScoreDoc[] sortedDocs,
                                         ReducedQueryPhase reducedQueryPhase,
-                                        AtomicArray<? extends QuerySearchResultProvider> fetchResultsArr) {
+                                        Collection<? extends SearchPhaseResult> fetchResults, IntFunction<SearchPhaseResult> resultsLookup) {
         if (reducedQueryPhase.isEmpty()) {
             return InternalSearchResponse.empty();
         }
-        List<? extends AtomicArray.Entry<? extends QuerySearchResultProvider>> fetchResults = fetchResultsArr.asList();
-        SearchHits hits = getHits(reducedQueryPhase, ignoreFrom, sortedDocs, fetchResultsArr);
+        SearchHits hits = getHits(reducedQueryPhase, ignoreFrom, sortedDocs, fetchResults, resultsLookup);
         if (reducedQueryPhase.suggest != null) {
             if (!fetchResults.isEmpty()) {
                 int currentOffset = hits.getHits().length;
@@ -353,8 +302,12 @@ public class SearchPhaseController extends AbstractComponent {
                     final List<CompletionSuggestion.Entry.Option> suggestionOptions = suggestion.getOptions();
                     for (int scoreDocIndex = currentOffset; scoreDocIndex < currentOffset + suggestionOptions.size(); scoreDocIndex++) {
                         ScoreDoc shardDoc = sortedDocs[scoreDocIndex];
-                        QuerySearchResultProvider searchResultProvider = fetchResultsArr.get(shardDoc.shardIndex);
+                        SearchPhaseResult searchResultProvider = resultsLookup.apply(shardDoc.shardIndex);
                         if (searchResultProvider == null) {
+                            // this can happen if we are hitting a shard failure during the fetch phase
+                            // in this case we referenced the shard result via teh ScoreDoc but never got a
+                            // result from fetch.
+                            // TODO it would be nice to assert this in the future
                             continue;
                         }
                         FetchSearchResult fetchResult = searchResultProvider.fetchResult();
@@ -364,7 +317,7 @@ public class SearchPhaseController extends AbstractComponent {
                             CompletionSuggestion.Entry.Option suggestOption =
                                 suggestionOptions.get(scoreDocIndex - currentOffset);
                             hit.score(shardDoc.score);
-                            hit.shard(fetchResult.shardTarget());
+                            hit.shard(fetchResult.getSearchShardTarget());
                             suggestOption.setHit(hit);
                         }
                     }
@@ -377,8 +330,7 @@ public class SearchPhaseController extends AbstractComponent {
     }
 
     private SearchHits getHits(ReducedQueryPhase reducedQueryPhase, boolean ignoreFrom, ScoreDoc[] sortedDocs,
-                               AtomicArray<? extends QuerySearchResultProvider> fetchResultsArr) {
-        List<? extends AtomicArray.Entry<? extends QuerySearchResultProvider>> fetchResults = fetchResultsArr.asList();
+                               Collection<? extends SearchPhaseResult> fetchResults, IntFunction<SearchPhaseResult> resultsLookup) {
         boolean sorted = false;
         int sortScoreIndex = -1;
         if (reducedQueryPhase.oneResult.topDocs() instanceof TopFieldDocs) {
@@ -396,8 +348,8 @@ public class SearchPhaseController extends AbstractComponent {
             }
         }
         // clean the fetch counter
-        for (AtomicArray.Entry<? extends QuerySearchResultProvider> entry : fetchResults) {
-            entry.value.fetchResult().initCounter();
+        for (SearchPhaseResult entry : fetchResults) {
+            entry.fetchResult().initCounter();
         }
         int from = ignoreFrom ? 0 : reducedQueryPhase.oneResult.queryResult().from();
         int numSearchHits = (int) Math.min(reducedQueryPhase.fetchHits - from, reducedQueryPhase.oneResult.size());
@@ -408,8 +360,12 @@ public class SearchPhaseController extends AbstractComponent {
         if (!fetchResults.isEmpty()) {
             for (int i = 0; i < numSearchHits; i++) {
                 ScoreDoc shardDoc = sortedDocs[i];
-                QuerySearchResultProvider fetchResultProvider = fetchResultsArr.get(shardDoc.shardIndex);
+                SearchPhaseResult fetchResultProvider = resultsLookup.apply(shardDoc.shardIndex);
                 if (fetchResultProvider == null) {
+                    // this can happen if we are hitting a shard failure during the fetch phase
+                    // in this case we referenced the shard result via teh ScoreDoc but never got a
+                    // result from fetch.
+                    // TODO it would be nice to assert this in the future
                     continue;
                 }
                 FetchSearchResult fetchResult = fetchResultProvider.fetchResult();
@@ -417,7 +373,7 @@ public class SearchPhaseController extends AbstractComponent {
                 if (index < fetchResult.hits().internalHits().length) {
                     SearchHit searchHit = fetchResult.hits().internalHits()[index];
                     searchHit.score(shardDoc.score);
-                    searchHit.shard(fetchResult.shardTarget());
+                    searchHit.shard(fetchResult.getSearchShardTarget());
                     if (sorted) {
                         FieldDoc fieldDoc = (FieldDoc) shardDoc;
                         searchHit.sortValues(fieldDoc.fields, reducedQueryPhase.oneResult.sortValueFormats());
@@ -437,7 +393,7 @@ public class SearchPhaseController extends AbstractComponent {
      * Reduces the given query results and consumes all aggregations and profile results.
      * @param queryResults a list of non-null query shard results
      */
-    public final ReducedQueryPhase reducedQueryPhase(List<? extends AtomicArray.Entry<? extends QuerySearchResultProvider>> queryResults) {
+    public ReducedQueryPhase reducedQueryPhase(List<? extends SearchPhaseResult> queryResults) {
         return reducedQueryPhase(queryResults, null, 0);
     }
 
@@ -450,7 +406,7 @@ public class SearchPhaseController extends AbstractComponent {
      * @see QuerySearchResult#consumeAggs()
      * @see QuerySearchResult#consumeProfileResult()
      */
-    private ReducedQueryPhase reducedQueryPhase(List<? extends AtomicArray.Entry<? extends QuerySearchResultProvider>> queryResults,
+    private ReducedQueryPhase reducedQueryPhase(Collection<? extends SearchPhaseResult> queryResults,
                                                      List<InternalAggregations> bufferdAggs, int numReducePhases) {
         assert numReducePhases >= 0 : "num reduce phases must be >= 0 but was: " + numReducePhases;
         numReducePhases++; // increment for this phase
@@ -463,7 +419,7 @@ public class SearchPhaseController extends AbstractComponent {
             return new ReducedQueryPhase(totalHits, fetchHits, maxScore, timedOut, terminatedEarly, null, null, null, null,
                 numReducePhases);
         }
-        final QuerySearchResult firstResult = queryResults.get(0).value.queryResult();
+        final QuerySearchResult firstResult = queryResults.stream().findFirst().get().queryResult();
         final boolean hasSuggest = firstResult.suggest() != null;
         final boolean hasProfileResults = firstResult.hasProfileResults();
         final boolean consumeAggs;
@@ -487,8 +443,8 @@ public class SearchPhaseController extends AbstractComponent {
         final Map<String, List<Suggestion>> groupedSuggestions = hasSuggest ? new HashMap<>() : Collections.emptyMap();
         final Map<String, ProfileShardResult> profileResults = hasProfileResults ? new HashMap<>(queryResults.size())
             : Collections.emptyMap();
-        for (AtomicArray.Entry<? extends QuerySearchResultProvider> entry : queryResults) {
-            QuerySearchResult result = entry.value.queryResult();
+        for (SearchPhaseResult entry : queryResults) {
+            QuerySearchResult result = entry.queryResult();
             if (result.searchTimedOut()) {
                 timedOut = true;
             }
@@ -515,7 +471,7 @@ public class SearchPhaseController extends AbstractComponent {
                 aggregationsList.add((InternalAggregations) result.consumeAggs());
             }
             if (hasProfileResults) {
-                String key = result.shardTarget().toString();
+                String key = result.getSearchShardTarget().toString();
                 profileResults.put(key, result.consumeProfileResult());
             }
         }
@@ -601,7 +557,7 @@ public class SearchPhaseController extends AbstractComponent {
 
         /**
          * Creates a new search response from the given merged hits.
-         * @see #merge(boolean, ScoreDoc[], ReducedQueryPhase, AtomicArray)
+         * @see #merge(boolean, ScoreDoc[], ReducedQueryPhase, Collection, IntFunction)
          */
         public InternalSearchResponse buildResponse(SearchHits hits) {
             return new InternalSearchResponse(hits, aggregations, suggest, shardResults, timedOut, terminatedEarly, numReducePhases);
@@ -622,7 +578,7 @@ public class SearchPhaseController extends AbstractComponent {
      * iff the buffer is exhausted.
      */
     static final class QueryPhaseResultConsumer
-        extends InitialSearchPhase.SearchPhaseResults<QuerySearchResultProvider> {
+        extends InitialSearchPhase.SearchPhaseResults<SearchPhaseResult> {
         private final InternalAggregations[] buffer;
         private int index;
         private final SearchPhaseController controller;
@@ -649,8 +605,8 @@ public class SearchPhaseController extends AbstractComponent {
         }
 
         @Override
-        public void consumeResult(int shardIndex, QuerySearchResultProvider result) {
-            super.consumeResult(shardIndex, result);
+        public void consumeResult(SearchPhaseResult result) {
+            super.consumeResult(result);
             QuerySearchResult queryResult = result.queryResult();
             assert queryResult.hasAggs() : "this collector should only be used if aggs are requested";
             consumeInternal(queryResult);
@@ -691,7 +647,7 @@ public class SearchPhaseController extends AbstractComponent {
     /**
      * Returns a new SearchPhaseResults instance. This might return an instance that reduces search responses incrementally.
      */
-    InitialSearchPhase.SearchPhaseResults<QuerySearchResultProvider> newSearchPhaseResults(SearchRequest request, int numShards) {
+    InitialSearchPhase.SearchPhaseResults<SearchPhaseResult> newSearchPhaseResults(SearchRequest request, int numShards) {
         SearchSourceBuilder source = request.source();
         if (source != null && source.aggregations() != null) {
             if (request.getBatchedReduceSize() < numShards) {
